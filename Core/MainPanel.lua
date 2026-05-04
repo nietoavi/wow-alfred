@@ -57,6 +57,8 @@ local KIND_COLORS = {
     oil     = "ff9094a0",
     potion  = "ff9094a0",
     elixir  = "ff9094a0",
+    tailor  = "ff9094a0",
+    cloth   = "ff9094a0",
 }
 
 -- WoW tradeskill difficulty colors (orange/yellow/green/gray). Slightly toned
