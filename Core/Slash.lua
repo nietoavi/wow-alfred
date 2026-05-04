@@ -191,7 +191,10 @@ SlashCmdList["ALFREDENCHANTING"] = function(msg)
                 print("|cff00ff00[Alfred]|r Cleared cached recipe list for " .. (def and def.name or profId) .. " (this character).")
             end
         else
-            local learned, total = (A.CraftList and A.CraftList.GetStats and A.CraftList.GetStats(profId)) or (0, 0)
+            local learned, total = 0, 0
+            if A.CraftList and A.CraftList.GetStats then
+                learned, total = A.CraftList.GetStats(profId)
+            end
             print(string.format("|cff00ff00[Alfred]|r %s recipes cached for this char: |cffeaeaee%d|r / %d listed in guide.",
                 (def and def.name) or "?", learned, total))
             print("|cff5a5e68  /alfred recipes rescan -- re-scan the open profession window|r")
