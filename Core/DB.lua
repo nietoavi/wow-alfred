@@ -78,7 +78,14 @@ function A.DB.Init()
 
     AlfredDB = AlfredDB or { professions = {} }
     AlfredDB.professions = AlfredDB.professions or {}
-    AlfredDB.activeProfession = AlfredDB.activeProfession or "enchanting"
+
+    -- Apply the saved active profession if it points to a registered one. We
+    -- intentionally do NOT default it here when missing — Engine.PLAYER_LOGIN
+    -- runs the "first learned" auto-pick once the skill-line API is reliable.
+    local savedActive = AlfredDB.activeProfession
+    if savedActive and Alfred.GetProfession(savedActive) then
+        Alfred.SetActiveProfession(savedActive)
+    end
 
     -- Ensure a sub-table for each registered profession.
     -- NOTE: we do NOT auto-populate slots with defaults — the user starts

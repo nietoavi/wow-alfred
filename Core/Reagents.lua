@@ -59,8 +59,10 @@ function A.Reagents.CheckStep(entry)
     }
     if not entry or not entry.spell then return result end
 
-    -- 1) Spell learned
-    result.learned = A.Spells.IsLearned(entry.spell)
+    -- 1) Spell learned. Pass the whole entry so IsLearned can use the
+    -- skill-range heuristic when no other detection method works (avoids
+    -- forcing the player to open the profession window first).
+    result.learned = A.Spells.IsLearned(entry.spell, entry)
 
     -- 2a) New path: structured materials with itemId.
     if entry.materials and #entry.materials > 0 then
@@ -87,6 +89,68 @@ function A.Reagents.CheckStep(entry)
         end
     end
     return result
+end
+
+-- ============================================================================
+-- MaxCraftsFor(entry): how many times can the player craft this recipe RIGHT
+-- NOW given what's currently in their bag/bank? Returns 0 if any reagent is
+-- below the per-cast requirement, otherwise the bottleneck of all reagents.
+-- Used to populate the "Craft (N)" button label and to pass an explicit
+-- count to DoTradeSkill so the server enqueues the whole batch.
+-- ============================================================================
+function A.Reagents.MaxCraftsFor(entry)
+    if not entry or not entry.materials or #entry.materials == 0 then return 1 end
+    local total = entry.quantity or entry.count or 1
+    local minPossible = math.huge
+    for _, m in ipairs(entry.materials) do
+        local perCast = (total > 0) and math.ceil(m.quantity / total) or m.quantity
+        if perCast > 0 then
+            local have = CountItem(m.itemId, m.name)
+            local maxFromThis = math.floor((have or 0) / perCast)
+            if maxFromThis < minPossible then minPossible = maxFromThis end
+        end
+    end
+    if minPossible == math.huge then return 0 end
+    return math.max(0, minPossible)
+end
+
+-- ============================================================================
+-- CraftsToReachSkillEnd(entry): heuristic for "how many more crafts before
+-- the player levels past this step's skillEnd?". Used to cap the bulk
+-- queue so we don't waste mats once the step's purpose is fulfilled.
+--
+--   Effective target = min(step.skillEnd, current profession cap)
+--     -- if the player hasn't visited a trainer, capping at the cap
+--     prevents queueing crafts that can't possibly land a skill point.
+--   Crafts per skill point (color-based, with a 20% safety margin):
+--     orange = 1.0  (every craft gives a point)
+--     yellow = 1.5  (~75% chance per craft)
+--     green  = 4.0  (~25% chance per craft)
+--     gray   = inf  (no skill ups -- skip the cap)
+--
+-- Returns 0 if the player has already reached the step's effective skillEnd.
+-- ============================================================================
+function A.Reagents.CraftsToReachSkillEnd(entry)
+    if not entry or not entry.skillEnd then return math.huge end
+    if not Alfred or not Alfred.IsProfessionLearned then return math.huge end
+    local profId = Alfred.GetActiveProfessionId()
+    if not profId then return math.huge end
+    local _, currentSkill, maxRank = Alfred.IsProfessionLearned(profId)
+    currentSkill = currentSkill or 0
+    local target = entry.skillEnd
+    if maxRank and maxRank > 0 then target = math.min(target, maxRank) end
+    if currentSkill >= target then return 0 end
+
+    local color = entry.color or "orange"
+    local craftsPerPoint
+    if     color == "orange" then craftsPerPoint = 1.0
+    elseif color == "yellow" then craftsPerPoint = 1.5
+    elseif color == "green"  then craftsPerPoint = 4.0
+    else                          craftsPerPoint = math.huge  -- gray, no cap
+    end
+
+    if craftsPerPoint == math.huge then return math.huge end
+    return math.ceil((target - currentSkill) * craftsPerPoint * 1.2)
 end
 
 -- ============================================================================

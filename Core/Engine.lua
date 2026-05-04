@@ -30,6 +30,32 @@ function A.Engine.SetListen(b) listenMode = b end
 function A.Engine.IsListening() return listenMode end
 
 -- ============================================================================
+-- Profession switching (shared by slash command + UI dropdown)
+-- ============================================================================
+-- Picks the best profession to land on at boot when the user has no saved
+-- preference: first learned in registration order, falling back to the first
+-- registered if none are learned (the player can still consult its guide).
+function A.Engine.PickDefaultProfession()
+    local list = Alfred.GetRegisteredProfessions()
+    for _, id in ipairs(list) do
+        if Alfred.IsProfessionLearned(id) then return id end
+    end
+    return list[1]
+end
+
+-- Switches active profession, persists it, and refreshes the panel.
+-- Returns true on success, false+message on failure.
+function A.Engine.SwitchProfession(id)
+    local ok, err = Alfred.SetActiveProfession(id)
+    if not ok then return false, err end
+    if AlfredDB then AlfredDB.activeProfession = id end
+    if A.UI and A.UI.MainPanel and A.UI.MainPanel.OnProfessionChanged then
+        A.UI.MainPanel.OnProfessionChanged()
+    end
+    return true
+end
+
+-- ============================================================================
 -- Skill tracking
 -- ============================================================================
 local function StatsKey(spellName) return spellName end
@@ -223,6 +249,7 @@ eventFrame:RegisterEvent("TRADE_SKILL_UPDATE")
 eventFrame:RegisterEvent("BAG_UPDATE_DELAYED")
 pcall(eventFrame.RegisterEvent, eventFrame, "LEARNED_SPELL_IN_TAB")
 pcall(eventFrame.RegisterEvent, eventFrame, "SKILL_LINES_CHANGED")
+pcall(eventFrame.RegisterEvent, eventFrame, "GET_ITEM_INFO_RECEIVED")
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if listenMode then
@@ -232,9 +259,19 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
             A.DB.Init()
-            print("|cff00ff00[Alfred:Enchanting]|r loaded. /alfred config to configure, /alfred show to display the panel.")
+            print("|cff00ff00[Alfred]|r loaded. /alfred prof list to see professions, /alfred show to display the panel.")
         end
     elseif event == "PLAYER_LOGIN" then
+        -- First-time activation: if the user has no saved preference, pick the
+        -- first profession the character actually has learned. Falls back to
+        -- the first registered (still consultable) when none are learned.
+        if AlfredDB and not AlfredDB.activeProfession then
+            local pick = A.Engine.PickDefaultProfession()
+            if pick then
+                Alfred.SetActiveProfession(pick)
+                AlfredDB.activeProfession = pick
+            end
+        end
         A.UI.MainPanel.Create()
         local shared = A.DB.Shared()
         if not (shared and shared.minimapHide) then
@@ -243,6 +280,11 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
     elseif event == "TRADE_SKILL_SHOW" then
         if not A.UI.MainPanel.GetContainer() then A.UI.MainPanel.Create() end
         lastKnownRank = A.Tradeskill.GetCurrentRank()
+        -- Populate the per-char learned-recipes cache so future "is this
+        -- spell learned?" lookups don't depend on the panel being open.
+        if A.CraftList and A.CraftList.ScanOpenTradeskill then
+            A.CraftList.ScanOpenTradeskill()
+        end
         if A.Profession.IsTradeskillOpen() then
             if not sawEnchantingOnce then
                 print("|cff00ff00[Alfred:Enchanting]|r active on Enchanting. /aen show if you don't see the panel.")
@@ -261,12 +303,50 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
             A.Engine.RecordSkillUp(bulkLastSpell, newRank - lastKnownRank)
         end
         lastKnownRank = newRank
+        -- TRADE_SKILL_UPDATE also fires when the player learns a new recipe
+        -- with the panel open -- catch the new entries.
+        if A.CraftList and A.CraftList.ScanOpenTradeskill then
+            A.CraftList.ScanOpenTradeskill()
+        end
         A.UI.MainPanel.UpdateButton()
     elseif event == "BAG_UPDATE_DELAYED" then
         A.UI.MainPanel.UpdateButton()
     elseif event == "LEARNED_SPELL_IN_TAB" or event == "SKILL_LINES_CHANGED" then
         A.Spells.InvalidateCache()
+        if Alfred and Alfred.InvalidateLearnedCache then
+            Alfred.InvalidateLearnedCache()
+        end
         A.UI.MainPanel.UpdateButton()
+        -- Skill-goal notification: when a craft queue pushes the player's
+        -- skill past the active step's skillEnd, print a one-shot reminder
+        -- so they can move to interrupt the remaining crafts. Keyed by
+        -- profId+stepIdx so navigating to a different step re-arms it.
+        if Alfred and A.UI and A.UI.MainPanel and A.UI.MainPanel.GetGuideEntry then
+            local profId = Alfred.GetActiveProfessionId()
+            local cur    = A.UI.MainPanel.GetCurrentStep()
+            local entry  = A.UI.MainPanel.GetGuideEntry(cur)
+            if profId and entry and entry.skillEnd then
+                local _, rank = Alfred.IsProfessionLearned(profId)
+                if rank and rank >= entry.skillEnd then
+                    A.Engine._lastSkillNotice = A.Engine._lastSkillNotice or {}
+                    local key = profId .. ":" .. tostring(cur)
+                    if A.Engine._lastSkillNotice[profId] ~= key then
+                        print(string.format("|cffe6b870[Alfred]|r Skill %d reached -- step done. Move/walk to interrupt remaining crafts in the queue, then advance to the next step.",
+                            entry.skillEnd))
+                        A.Engine._lastSkillNotice[profId] = key
+                    end
+                end
+            end
+        end
+    elseif event == "GET_ITEM_INFO_RECEIVED" then
+        -- The first time the client encounters an item id (vendor recipe,
+        -- alt-path herb the player has never seen), GetItemInfo returns nil
+        -- and the icon falls back to the question-mark texture. When the
+        -- info finally arrives, we re-render once. Throttle so a flood of
+        -- events (login boot) doesn't trigger N back-to-back renders.
+        if A.UI and A.UI.MainPanel and A.UI.MainPanel.QueueIconRefresh then
+            A.UI.MainPanel.QueueIconRefresh()
+        end
     end
 end)
 
