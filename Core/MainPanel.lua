@@ -55,6 +55,8 @@ local KIND_COLORS = {
     rod     = "ff9094a0",
     wand    = "ff9094a0",
     oil     = "ff9094a0",
+    potion  = "ff9094a0",
+    elixir  = "ff9094a0",
 }
 
 -- WoW tradeskill difficulty colors (orange/yellow/green/gray). Slightly toned
@@ -70,16 +72,19 @@ local DIFFICULTY_COLORS = {
 -- Module state
 -- ============================================================================
 local mainFrame             -- root frame
-local currentTab = "guide"  -- "guide" | "shopping" | "config"
-local guidePanel, shoppingPanel, configPanel
+local currentTab = "guide"  -- "guide" | "shopping" | "config" | "trainer"
+local prevTab = "guide"     -- last non-trainer tab; restored when trainer closes
+local guidePanel, shoppingPanel, configPanel, trainerPanel
 local skillBarTrack, skillBarFill, skillBarText
 local navStepLabel, prevBtn, nextBtn, statusText
-local tabGuide, tabShopping, tabConfig
-local castBtn, macrosBtn                    -- footer buttons
+local tabGuide, tabShopping, tabConfig, tabTrainer
+local castBtn, craft1Btn, macrosBtn         -- footer buttons (craft1Btn: single-craft, only for tradeskill kinds)
 local footerIcon, footerIconTex             -- footer recipe icon (mirrors guide rows)
 local footerSpellLabel, footerItemLabel, footerReqLabel, footerStatusLabel
 local footerMatsContainer                   -- holds clickable material chip buttons
 local selectedSlotKey = nil  -- slot the user marked for assignment via shift+click
+local headerIcon, titleStr  -- header texture + title (refreshed when switching profession)
+local profSwitcherBtn       -- caret/button next to the title that opens the profession menu
 
 -- ============================================================================
 -- Drawing helpers (TSM/Artisan style)
@@ -261,6 +266,13 @@ function A.UI.MainPanel.GetCurrentStep()
     local data = A.Profession.data
     local total = (data and data.steps and #data.steps) or 1
     if n > total then n = total end
+    -- If the persisted step landed on a header (e.g. data was edited), nudge
+    -- forward to the next real step so the footer/macro never try to render
+    -- a header as a recipe.
+    while n <= total and data and data.steps and data.steps[n] and data.steps[n].kind == "header" do
+        n = n + 1
+    end
+    if n > total then n = total end
     p.currentStep = n
     return n
 end
@@ -353,6 +365,40 @@ local function RenderGuideTab()
     local totalH = 0
 
     for i, step in ipairs(data.steps) do
+        -- Header row (kind == "header"): visual divider that groups the
+        -- following steps. No icon, no badge, no click — just a strip with
+        -- a label. The text comes from step.recipeName.
+        if step.kind == "header" then
+            local hRowH = 24
+            local hRow = CreateFrame("Frame", nil, child)
+            hRow:SetSize(rowWidth, hRowH)
+            hRow:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -totalH)
+
+            local hBg = hRow:CreateTexture(nil, "BACKGROUND")
+            hBg:SetAllPoints()
+            hBg:SetColorTexture(0.04, 0.05, 0.07, 0.95)
+
+            -- Top + bottom hairlines so the band stands out from regular rows.
+            local topLn = hRow:CreateTexture(nil, "ARTWORK")
+            topLn:SetHeight(1)
+            topLn:SetPoint("TOPLEFT",  hRow, "TOPLEFT",  0, 0)
+            topLn:SetPoint("TOPRIGHT", hRow, "TOPRIGHT", 0, 0)
+            topLn:SetColorTexture(0.20, 0.22, 0.30, 0.7)
+            local botLn = hRow:CreateTexture(nil, "ARTWORK")
+            botLn:SetHeight(1)
+            botLn:SetPoint("BOTTOMLEFT",  hRow, "BOTTOMLEFT",  0, 0)
+            botLn:SetPoint("BOTTOMRIGHT", hRow, "BOTTOMRIGHT", 0, 0)
+            botLn:SetColorTexture(0.20, 0.22, 0.30, 0.7)
+
+            local hLbl = hRow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            hLbl:SetPoint("LEFT", hRow, "LEFT", 12, 0)
+            hLbl:SetPoint("RIGHT", hRow, "RIGHT", -12, 0)
+            hLbl:SetJustifyH("LEFT")
+            hLbl:SetText(C.cyan .. (step.recipeName or "") .. C.reset)
+
+            totalH = totalH + hRowH
+        else
+
         local status = ComputeStepStatus(step, currentSkill)
         local isSelected = (i == selectedStep)
 
@@ -361,9 +407,16 @@ local function RenderGuideTab()
         local rowH = 50
         if hasNotes then rowH = rowH + 22 end
 
-        local row = CreateFrame("Button", nil, child)
+        -- Rows are SECURE so a click can additionally open the profession
+        -- (when the active profession isn't enchanting and the tradeskill
+        -- list isn't loaded yet). The macrotext is set by
+        -- UpdateProfOpenerSecure; SetStep runs via HookScript alongside
+        -- the secure dispatch.
+        local row = CreateFrame("Button", nil, child, "SecureActionButtonTemplate")
         row:SetSize(rowWidth, rowH)
         row:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -totalH)
+        row:SetAttribute("type", "macro")
+        UpdateProfOpenerSecure(row)
 
         -- Steps past the player's skill look disabled — reduced alpha affects
         -- all descendants (bg, icon, text) uniformly. Still clickable so the
@@ -489,10 +542,13 @@ local function RenderGuideTab()
         -- Click on the row → set as the selected step.
         -- Capture `i` and `step` by upvalue so the closure doesn't get
         -- confused with the loop's `i` when it executes later.
+        -- HookScript so the secure dispatch (open profession via macrotext)
+        -- still runs on TBC Classic; SetScript("OnClick") would replace
+        -- the secure handler.
         local rowIdx, rowStep = i, step
         row:EnableMouse(true)
         row:RegisterForClicks("LeftButtonUp")
-        row:SetScript("OnClick", function()
+        row:HookScript("OnClick", function()
             A.UI.MainPanel.SetStep(rowIdx)
         end)
         row:SetScript("OnEnter", function(self)
@@ -515,6 +571,7 @@ local function RenderGuideTab()
         end)
 
         totalH = totalH + rowH
+        end  -- closes the `else` of the kind == "header" check
     end
 
     child:SetHeight(math.max(totalH, 1))
@@ -536,11 +593,14 @@ end
 
 -- Column geometry. Right edges are negative offsets from the row's right edge.
 -- Each column reserves ~width characters of right-aligned space.
-local COL_NEED_R   = -240
-local COL_HAVE_R   = -190
-local COL_BUY_R    = -140
-local COL_PRICE_R  = -8
-local COL_NAME_R   = -250  -- name's right edge sits just before Need
+-- Layout (from name to right edge):
+--   [Material .........] [Need] [Have] [Buy] [ Price ea. ] [   Total   ]
+local COL_NEED_R   = -272
+local COL_HAVE_R   = -228
+local COL_BUY_R    = -184
+local COL_PRICE_R  = -96   -- per-unit cost
+local COL_TOTAL_R  = -8    -- Buy x Price, the rightmost (most-eye-catching) column
+local COL_NAME_R   = -316  -- name's right edge sits just before Need
 
 -- Coin-text helper: WoW's GetCoinTextureString already renders gold/silver/
 -- copper icons inline. Falls back to plain "Ng Ms Kc" if unavailable.
@@ -573,6 +633,11 @@ local function RenderShoppingTab()
     -- + vendor sub-line (which itself wraps for vendors with H/A pairs +
     -- limited-supply notes) + padding. 68px covers the worst-case row.
     local rowH_rec  = 68
+    -- Alt rows need extra height because the name carries the path label
+    -- in parentheses ("Dreamfoil (Major Mana Potion, 17x)") and wraps to a
+    -- second line on most realms. The extra 4px at the bottom acts as a
+    -- visual gap between consecutive alt rows.
+    local rowH_alt  = 42
     local sectionH  = 22
     local totalH    = 0
 
@@ -586,7 +651,7 @@ local function RenderShoppingTab()
     local topLbl = topHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     topLbl:SetPoint("LEFT", topHeader, "LEFT", 8, 0)
     topLbl:SetText(string.format(
-        "%sclick = AH (captures price) · shift+click = chat · right-click = Wowhead%s",
+        "%sclick = AH (captures price) | shift+click = chat | right-click = Wowhead%s",
         C.dim, C.reset))
     totalH = totalH + 20
 
@@ -616,10 +681,11 @@ local function RenderShoppingTab()
         nameLbl:SetPoint("LEFT", h, "LEFT", 8, 0)
         nameLbl:SetTextColor(0.55, 0.58, 0.65)
         nameLbl:SetText("Material")
-        Col("Need",      COL_NEED_R,  44)
-        Col("Have",      COL_HAVE_R,  44)
-        Col("Buy",       COL_BUY_R,   44)
-        Col("Price ea.", COL_PRICE_R, 120)
+        Col("Need",      COL_NEED_R,  36)
+        Col("Have",      COL_HAVE_R,  36)
+        Col("Buy",       COL_BUY_R,   36)
+        Col("Price ea.", COL_PRICE_R, 80)
+        Col("Total",     COL_TOTAL_R, 80)
         local sep = h:CreateTexture(nil, "ARTWORK")
         sep:SetHeight(1)
         sep:SetPoint("BOTTOMLEFT",  h, "BOTTOMLEFT",  0, 0)
@@ -649,17 +715,44 @@ local function RenderShoppingTab()
 
     MakeColumnHeader()
 
+    -- Pre-scan: build two sets so we can:
+    --   1. Flag main rows whose item also appears in alts ("[also for alts]")
+    --   2. SKIP alt rows whose item already lives in the main list (dedup)
+    -- The dedup keeps each item visible exactly once. Alts then only show
+    -- reagents EXCLUSIVE to alternative paths (Dreamfoil, Icecap, etc.).
+    local mainIds, altIds = {}, {}
+    for _, item in ipairs(list) do
+        if item.id then
+            local k = item.kind or "material"
+            if k == "alt"      then altIds[item.id]  = true
+            elseif k == "material" then mainIds[item.id] = true
+            end
+        end
+    end
+
     -- Running subtotals — materials and recipes are summed independently so
     -- the footer can show each group on its own line.
     local matTotal, recTotal = 0, 0
     local lastKind
 
     for _, item in ipairs(list) do
+      -- repeat ... until true is the Lua 5.1 idiom for "continue" (no goto).
+      repeat
         local kind = item.kind or "material"
+
+        -- Dedup: alt rows whose item is already covered by the main list are
+        -- silently skipped (they'd just duplicate quantities). The "[also
+        -- for alts]" marker on the corresponding main row tells the user
+        -- it's also relevant to alternative paths.
+        if kind == "alt" and item.id and mainIds[item.id] then
+            break
+        end
 
         if kind ~= lastKind then
             if kind == "recipe" then
                 MakeSectionHeader("Vendor recipes")
+            elseif kind == "alt" then
+                MakeSectionHeader("Alternatives -- pick the cheapest path (totals excluded)")
             end
             lastKind = kind
         end
@@ -671,12 +764,33 @@ local function RenderShoppingTab()
         local have = (item.id and GetItemCount and GetItemCount(item.id, true)) or 0
         local buy  = math.max(0, need - have)
         local hasEnough = (have >= need)
-        local rowH = (kind == "recipe") and rowH_rec or rowH_mat
-        local price = item.id and A.AHPrices and A.AHPrices.Get(item.id) or nil
+        local rowH = (kind == "recipe") and rowH_rec
+                  or (kind == "alt")    and rowH_alt
+                  or rowH_mat
+        -- Price lookup cascade for shopping list:
+        --   1. Captured vendor price (live, includes rep discount)
+        --   2. Hardcoded item.vendorPrice from the profession data
+        --   3. Captured AH buyout (lowest seen on any scan)
+        -- priceSource lets the renderer mark vendor prices with a "(v)" tag
+        -- so the user knows where the number comes from.
+        local price, priceSource
+        if item.id and A.VendorPrices then
+            local v = A.VendorPrices.Get(item.id)
+            if v then price, priceSource = v, "vendor" end
+        end
+        if not price and item.vendorPrice then
+            price, priceSource = item.vendorPrice, "vendor"
+        end
+        if not price and item.id and A.AHPrices then
+            local ah = A.AHPrices.Get(item.id)
+            if ah then price, priceSource = ah, "ah" end
+        end
         local excluded = item.id and A.DB and A.DB.IsExcluded and A.DB.IsExcluded(item.id)
 
-        -- Sum into the matching group only if not excluded
-        if not excluded and price and buy > 0 then
+        -- Sum into the matching group only if not excluded.
+        -- "alt" entries (alternative-path materials) NEVER contribute to totals
+        -- -- they exist as info only, since the player only follows one path.
+        if not excluded and price and buy > 0 and kind ~= "alt" then
             if kind == "material" then matTotal = matTotal + (buy * price)
             else                       recTotal = recTotal + (buy * price)
             end
@@ -690,6 +804,7 @@ local function RenderShoppingTab()
         -- Excluded rows render at low alpha so they're clearly de-emphasized
         -- but still readable. The user can shift+click again to re-include.
         if excluded then row:SetAlpha(0.4) end
+        if kind == "alt" and not excluded then row:SetAlpha(0.7) end
 
         local bg = row:CreateTexture(nil, "BACKGROUND")
         bg:SetAllPoints()
@@ -702,7 +817,8 @@ local function RenderShoppingTab()
         -- Icon
         local iconTex = row:CreateTexture(nil, "ARTWORK")
         iconTex:SetSize(16, 16)
-        iconTex:SetPoint("TOPLEFT", row, "TOPLEFT", 6, -(kind == "recipe" and 6 or 3))
+        local iconTop = (kind == "recipe" or kind == "alt") and 6 or 3
+        iconTex:SetPoint("TOPLEFT", row, "TOPLEFT", 6, -iconTop)
         iconTex:SetTexCoord(0.07, 0.93, 0.07, 0.93)
         local iconPath = item.id and select(10, GetItemInfo(item.id))
         iconTex:SetTexture(iconPath or "Interface\\Icons\\INV_Misc_QuestionMark")
@@ -723,6 +839,12 @@ local function RenderShoppingTab()
         if excluded then
             nameText = nameText .. "  " .. C.dim .. "(excluded)" .. C.reset
         end
+        -- Cross-ref: if this is a main material AND its id also appears in
+        -- an alt path entry, hint that the same item also covers alternatives
+        -- (the alt row itself is dedup'd away). Skip for "alt" and "recipe".
+        if kind == "material" and item.id and altIds[item.id] then
+            nameText = nameText .. "  " .. C.cyan .. "[also for alts]" .. C.reset
+        end
         nameLbl:SetText(nameText)
 
         -- Recipes also get a vendor / req sub-line below the name.
@@ -734,7 +856,7 @@ local function RenderShoppingTab()
             subLbl:SetTextColor(0.55, 0.58, 0.65)
             local sub = item.vendor or ""
             if item.req then
-                sub = sub .. "   " .. C.dim .. "· " .. item.req .. C.reset
+                sub = sub .. "   " .. C.dim .. "| " .. item.req .. C.reset
             end
             subLbl:SetText(sub)
         end
@@ -757,24 +879,44 @@ local function RenderShoppingTab()
             statusLbl:SetText(C.dim .. "?" .. C.reset)
         else
             -- Need (gray)
-            ColText(C.dim .. tostring(need) .. C.reset, COL_NEED_R, 44)
+            ColText(C.dim .. tostring(need) .. C.reset, COL_NEED_R, 36)
 
             -- Have (green if >= need, red if 0, white otherwise)
             local haveCol
             if have >= need then haveCol = C.green
             elseif have == 0 then haveCol = C.red
             else                  haveCol = C.white end
-            ColText(haveCol .. tostring(have) .. C.reset, COL_HAVE_R, 44)
+            ColText(haveCol .. tostring(have) .. C.reset, COL_HAVE_R, 36)
 
-            -- Buy (red if > 0, "—" if 0)
+            -- Buy (red if > 0, "--" if 0)
             local buyText = (buy > 0)
                 and (C.red .. tostring(buy) .. C.reset)
-                or  (C.dim .. "—" .. C.reset)
-            ColText(buyText, COL_BUY_R, 44)
+                or  (C.dim .. "--" .. C.reset)
+            ColText(buyText, COL_BUY_R, 36)
 
-            -- Price ea. (formatted coin or "—")
-            local priceText = price and FormatCoin(price) or (C.dim .. "—" .. C.reset)
-            ColText(priceText, COL_PRICE_R, 120)
+            -- Price ea. (formatted coin + "(v)" suffix when sourced from a
+            -- vendor instead of the AH).
+            local priceText
+            if price then
+                priceText = FormatCoin(price)
+                if priceSource == "vendor" then
+                    priceText = priceText .. " " .. C.dim .. "(v)" .. C.reset
+                end
+            else
+                priceText = C.dim .. "--" .. C.reset
+            end
+            ColText(priceText, COL_PRICE_R, 80)
+
+            -- Total = Buy x Price ea. White when there's something to buy
+            -- and we have a price; dim "--" otherwise. Doesn't render the
+            -- (v) marker -- that lives on Price ea.
+            local totalText
+            if price and buy > 0 then
+                totalText = C.white .. (FormatCoin(buy * price) or "--") .. C.reset
+            else
+                totalText = C.dim .. "--" .. C.reset
+            end
+            ColText(totalText, COL_TOTAL_R, 80)
         end
 
         row:SetScript("OnEnter", function(self)
@@ -785,7 +927,7 @@ local function RenderShoppingTab()
                 and "ctrl+click = re-include in totals"
                 or  "ctrl+click = exclude from totals"
             GameTooltip:AddLine(string.format(
-                "%sclick%s = AH (captures price) · %sshift+click%s = chat · %s%s%s · %sright-click%s = Wowhead",
+                "%sclick%s = AH (captures price) | %sshift+click%s = chat | %s%s%s | %sright-click%s = Wowhead",
                 C.dim, C.reset, C.dim, C.reset, C.dim, ctrlHint, C.reset, C.dim, C.reset), 1, 1, 1, true)
             GameTooltip:Show()
         end)
@@ -806,12 +948,13 @@ local function RenderShoppingTab()
         end)
 
         totalH = totalH + rowH
+      until true
     end
 
     -- Update the sticky three-line footer with both subtotals + grand total.
     local function FooterText(total)
         if total > 0 then return C.white .. (FormatCoin(total) or "0") .. C.reset end
-        return C.dim .. "— (click items to capture prices)" .. C.reset
+        return C.dim .. "-- (click items to capture prices)" .. C.reset
     end
     if shoppingPanel.matTotalVal then shoppingPanel.matTotalVal:SetText(FooterText(matTotal)) end
     if shoppingPanel.recTotalVal then shoppingPanel.recTotalVal:SetText(FooterText(recTotal)) end
@@ -820,7 +963,7 @@ local function RenderShoppingTab()
         if grand > 0 then
             shoppingPanel.sumTotalVal:SetText(C.white .. (FormatCoin(grand) or "0") .. C.reset)
         else
-            shoppingPanel.sumTotalVal:SetText(C.dim .. "—" .. C.reset)
+            shoppingPanel.sumTotalVal:SetText(C.dim .. "--" .. C.reset)
         end
     end
 
@@ -852,6 +995,21 @@ local function RenderConfigTab()
     local rowWidth = child:GetWidth()
     local rowH = 30
     local totalH = 0
+
+    -- Profession with no per-slot target items (Alchemy, Cooking, etc.):
+    -- show a placeholder explaining there's nothing to configure.
+    if #slots == 0 then
+        local empty = child:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        empty:SetPoint("TOPLEFT", child, "TOPLEFT", 12, -16)
+        empty:SetPoint("RIGHT",   child, "RIGHT",   -12, 0)
+        empty:SetJustifyH("LEFT")
+        empty:SetTextColor(0.65, 0.68, 0.75)
+        empty:SetText(string.format(
+            "%s does not require per-slot target items.\nThe macro casts the recipe directly — no configuration needed.",
+            (A.Profession and A.Profession.name) or "This profession"))
+        child:SetHeight(80)
+        return
+    end
 
     -- Header with instructions
     local headerRow = CreateFrame("Frame", nil, child)
@@ -937,7 +1095,7 @@ local function RenderConfigTab()
         else
             local def = defaults[slotKey]
             if def and def ~= "" then
-                itemLbl:SetText(string.format("%sunassigned%s   %s· guide: %s%s",
+                itemLbl:SetText(string.format("%sunassigned%s   %s| guide: %s%s",
                     C.dim, C.reset, C.dim, def, C.reset))
             else
                 itemLbl:SetText(C.dim .. "unassigned" .. C.reset)
@@ -952,7 +1110,7 @@ local function RenderConfigTab()
             clearBtn:RegisterForClicks("LeftButtonUp")
             local clearLbl = clearBtn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
             clearLbl:SetPoint("CENTER")
-            clearLbl:SetText("×")
+            clearLbl:SetText("X")
             clearLbl:SetTextColor(0.55, 0.58, 0.65)
             clearBtn:SetScript("OnEnter", function() clearLbl:SetTextColor(0.95, 0.50, 0.50) end)
             clearBtn:SetScript("OnLeave", function() clearLbl:SetTextColor(0.55, 0.58, 0.65) end)
@@ -1050,13 +1208,167 @@ function A.UI.MainPanel.AssignSelectedSlot(itemLink)
 
     -- UpdateButton → RefreshAll → re-renders the active tab (Config) + footer.
     if AlfredEnchanting_UpdateButton then AlfredEnchanting_UpdateButton() end
-    print(string.format("|cff7fb87f[Alfred:Enchanting]|r |cffeaeaee%s|r → |cffeaeaee%s|r",
+    print(string.format("|cff7fb87f[Alfred:Enchanting]|r |cffeaeaee%s|r -> |cffeaeaee%s|r",
         itemName, slotLabel))
     return true
 end
 
 function A.UI.MainPanel.GetSelectedSlot() return selectedSlotKey end
 function A.UI.MainPanel.SetSelectedSlot(key) selectedSlotKey = key end
+
+-- ============================================================================
+-- Render: Trainer tab. Lists guide recipes available at the open trainer
+-- with [Learn] buttons and a "Learn All Available" call-to-action. Driven
+-- by Core/Trainer.lua via OpenTrainerTab/CloseTrainerTab.
+-- ============================================================================
+local function FormatCoinShort(copper)
+    if not copper or copper <= 0 then return "free" end
+    if GetCoinTextureString then return GetCoinTextureString(copper) end
+    local g = math.floor(copper / 10000)
+    local s = math.floor((copper % 10000) / 100)
+    local c = copper % 100
+    if g > 0 then return string.format("%dg %ds %dc", g, s, c) end
+    if s > 0 then return string.format("%ds %dc", s, c) end
+    return string.format("%dc", c)
+end
+
+local function RenderTrainerTab()
+    if not trainerPanel then return end
+    local old = trainerPanel.scrollChild
+    if old then old:Hide() end
+    local child = CreateFrame("Frame", nil, trainerPanel.scrollFrame)
+    child:SetWidth(FRAME_W - PAD * 2 - 36)
+    child:SetHeight(1)
+    trainerPanel.scrollFrame:SetScrollChild(child)
+    trainerPanel.scrollChild = child
+
+    local rowWidth = child:GetWidth()
+    local totalH = 0
+
+    -- Header strip
+    local count, totalCost, matches = 0, 0, {}
+    if A.Trainer and A.Trainer.ScanOpen then
+        count, totalCost, matches = A.Trainer.ScanOpen()
+    end
+
+    local headerRow = CreateFrame("Frame", nil, child)
+    headerRow:SetSize(rowWidth, 36)
+    headerRow:SetPoint("TOPLEFT", child, "TOPLEFT", 0, 0)
+    local hdrBg = headerRow:CreateTexture(nil, "BACKGROUND")
+    hdrBg:SetAllPoints()
+    hdrBg:SetColorTexture(0.09, 0.10, 0.12, 0.9)
+    local hdrLbl = headerRow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    hdrLbl:SetPoint("TOPLEFT", headerRow, "TOPLEFT", 8, -4)
+    hdrLbl:SetPoint("RIGHT",   headerRow, "RIGHT", -8, 0)
+    hdrLbl:SetJustifyH("LEFT")
+    if count == 0 then
+        hdrLbl:SetText(C.dim .. "No guide recipes match this trainer's offering." .. C.reset)
+    else
+        local availN = 0
+        for _, m in ipairs(matches) do
+            if m.kind == "available" then availN = availN + 1 end
+        end
+        hdrLbl:SetText(string.format("%sFrom your guide:|r %s%d here|r %s(%d available now)|r",
+            C.dim, C.white, count, C.dim, availN))
+    end
+    local hdrSub = headerRow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    hdrSub:SetPoint("BOTTOMLEFT", headerRow, "BOTTOMLEFT", 8, 4)
+    hdrSub:SetPoint("RIGHT",      headerRow, "RIGHT", -8, 0)
+    hdrSub:SetJustifyH("LEFT")
+    hdrSub:SetTextColor(0.55, 0.58, 0.65)
+    hdrSub:SetText("Click [Learn] on a row, or use the Learn All button at the bottom.")
+    totalH = totalH + 38
+
+    if count == 0 then
+        child:SetHeight(totalH + 20)
+        return
+    end
+
+    -- Sort: available first, then unavailable, ordered by skillStart.
+    table.sort(matches, function(a, b)
+        if a.kind ~= b.kind then return a.kind == "available" end
+        return (a.step.skillStart or 0) < (b.step.skillStart or 0)
+    end)
+
+    local rowH = 30
+    for _, m in ipairs(matches) do
+        local row = CreateFrame("Frame", nil, child)
+        row:SetSize(rowWidth, rowH)
+        row:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -totalH)
+
+        local bg = row:CreateTexture(nil, "BACKGROUND")
+        bg:SetAllPoints()
+        bg:SetColorTexture(0.07, 0.08, 0.09, 0.55)
+
+        if m.kind ~= "available" then row:SetAlpha(0.55) end
+
+        -- Left: name + range
+        local nameLbl = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        nameLbl:SetPoint("LEFT", row, "LEFT", 10, 0)
+        local rangeStr = (m.step.skillStart and m.step.skillEnd)
+            and string.format("  %s%d-%d|r", C.dim, m.step.skillStart, m.step.skillEnd) or ""
+        nameLbl:SetText((m.kind == "available" and C.white or C.dim) .. m.name .. C.reset .. rangeStr)
+
+        -- Right: cost + button (or status pill if not available)
+        if m.kind == "available" then
+            local btn = MakeFlatButton(row, "Learn", 60, 22)
+            btn:SetPoint("RIGHT", row, "RIGHT", -8, 0)
+            btn:RegisterForClicks("LeftButtonUp")
+            local capturedName = m.name
+            btn:SetScript("OnClick", function()
+                if A.Trainer and A.Trainer.LearnByName then
+                    A.Trainer.LearnByName(capturedName)
+                    -- TRAINER_UPDATE will fire and re-render the tab.
+                end
+            end)
+            local costLbl = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            costLbl:SetPoint("RIGHT", btn, "LEFT", -8, 0)
+            costLbl:SetTextColor(0.85, 0.85, 0.55)
+            costLbl:SetText(FormatCoinShort(m.cost))
+        else
+            local statusLbl = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            statusLbl:SetPoint("RIGHT", row, "RIGHT", -8, 0)
+            statusLbl:SetTextColor(0.55, 0.58, 0.65)
+            statusLbl:SetText(m.kind == "used" and "already learned" or "skill too low")
+        end
+
+        local sep = row:CreateTexture(nil, "ARTWORK")
+        sep:SetHeight(1)
+        sep:SetPoint("BOTTOMLEFT",  row, "BOTTOMLEFT",  0, 0)
+        sep:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+        sep:SetColorTexture(0.18, 0.20, 0.26, 0.5)
+
+        totalH = totalH + rowH
+    end
+
+    -- Bottom: Learn All button + total cost
+    totalH = totalH + 12
+    local availCount, availCost = 0, 0
+    for _, m in ipairs(matches) do
+        if m.kind == "available" then
+            availCount = availCount + 1
+            availCost  = availCost + (m.cost or 0)
+        end
+    end
+    if availCount > 0 then
+        local learnAllBtn = MakeFlatButton(child, string.format("Learn All Available (%d)", availCount), 240, 26)
+        learnAllBtn:SetPoint("TOPLEFT", child, "TOPLEFT", 8, -totalH)
+        learnAllBtn:RegisterForClicks("LeftButtonUp")
+        learnAllBtn:SetScript("OnClick", function()
+            if A.Trainer and A.Trainer.LearnAll then
+                local n, spent = A.Trainer.LearnAll()
+                print(string.format("|cff00ff00[Alfred]|r Learned %d recipe%s for %s.",
+                    n, n == 1 and "" or "s", FormatCoinShort(spent)))
+            end
+        end)
+        local totLbl = child:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        totLbl:SetPoint("LEFT", learnAllBtn, "RIGHT", 12, 0)
+        totLbl:SetText(string.format("%sTotal:|r %s%s|r", C.dim, C.white, FormatCoinShort(availCost)))
+        totalH = totalH + 32
+    end
+
+    child:SetHeight(math.max(totalH, 1))
+end
 
 -- ============================================================================
 -- Render: footer (icon + Cast + req + chips + status, fed by currentStep)
@@ -1113,7 +1425,7 @@ local function MakeMatChip(parent, mat, hasEnough, have, need)
         GameTooltip:AddLine(string.format("%sHave %d / Need %d%s",
             C.dim, have, need, C.reset), 1, 1, 1)
         GameTooltip:AddLine(string.format(
-            "%sclick%s = AH · %sshift+click%s = chat · %sright-click%s = Wowhead",
+            "%sclick%s = AH | %sshift+click%s = chat | %sright-click%s = Wowhead",
             C.dim, C.reset, C.dim, C.reset, C.dim, C.reset), 1, 1, 1, true)
         GameTooltip:Show()
     end)
@@ -1138,7 +1450,7 @@ local function RenderFooter()
     local optBadge = entry.optional and ("  " .. C.cyan .. "[OPT]" .. C.reset) or ""
 
     footerSpellLabel:SetText(string.format(
-        "%s▶%s  |c%s[%s]|r  %s%s%s%s%s",
+        "%s>%s  |c%s[%s]|r  %s%s%s%s%s",
         C.gold, C.reset,
         kindCol, kind:upper(),
         C.white, entry.spell, C.reset,
@@ -1166,14 +1478,14 @@ local function RenderFooter()
         if kind == "enchant" then
             if item and item ~= "" then
                 footerItemLabel:SetText(string.format(
-                    "%s→%s %s%s%s  %s(%s)%s",
+                    "%s->%s %s%s%s  %s(%s)%s",
                     C.gray, C.reset,
                     C.gold, item, C.reset,
                     C.dim, A.UI.MainPanel.GetSlotLabel(slot), C.reset))
                 footerItemLabel:Show()
             else
                 footerItemLabel:SetText(string.format(
-                    "%s→ no item for %s — /alfred config%s",
+                    "%s-> no item for %s -- /alfred config%s",
                     C.red, A.UI.MainPanel.GetSlotLabel(slot or "?"), C.reset))
                 footerItemLabel:Show()
             end
@@ -1192,12 +1504,12 @@ local function RenderFooter()
     -- conveyed by red chips below.
     if footerReqLabel then
         if not req.learned then
-            footerReqLabel:SetText(C.red .. "✗ Recipe not learned — train it" .. C.reset)
+            footerReqLabel:SetText(C.red .. "[x] Recipe not learned -- train it" .. C.reset)
         elseif req.hasAllMats then
-            footerReqLabel:SetText(C.green .. "✓ Recipe learned · ✓ Mats OK" .. C.reset)
+            footerReqLabel:SetText(C.green .. "[ok] Recipe learned  |  [ok] Mats OK" .. C.reset)
         else
-            footerReqLabel:SetText(C.green .. "✓ Recipe learned" .. C.reset
-                .. "   " .. C.orange .. "✗ Missing materials" .. C.reset)
+            footerReqLabel:SetText(C.green .. "[ok] Recipe learned" .. C.reset
+                .. "   " .. C.orange .. "[x] Missing materials" .. C.reset)
         end
     end
 
@@ -1237,10 +1549,33 @@ local function RenderFooter()
     local needsItem = (kind == "enchant")
     local canBuild  = entry.spell and (not needsItem or (item and item ~= ""))
 
+    -- For tradeskill crafts, compute how many we can do RIGHT NOW from bag
+    -- and embed it in the macro so a single click queues the whole batch
+    -- (server runs them ~1s apart, abort on movement). For enchants we keep
+    -- a count of 1 since each cast targets a single item slot.
+    --
+    -- Three caps applied in order:
+    --   1) matsAvailable    -- how many crafts the bag actually supports
+    --   2) step.quantity    -- the guide's recommended count for this step
+    --   3) craftsToSkillEnd -- color-based estimate of crafts left before
+    --      the player levels past skillEnd; prevents wasting mats on green/
+    --      gray crafts past the point of usefulness.
+    -- skillCapped flag tells the button it should say "Step complete" when
+    -- the third cap drove maxCrafts to 0 (i.e. the goal is already met).
+    local maxCrafts, skillCapped = 1, false
+    if kind ~= "enchant" then
+        local fromMats   = (A.Reagents.MaxCraftsFor and A.Reagents.MaxCraftsFor(entry)) or 1
+        local fromGuide  = entry.quantity or fromMats
+        local fromSkill  = (A.Reagents.CraftsToReachSkillEnd and A.Reagents.CraftsToReachSkillEnd(entry)) or math.huge
+        maxCrafts = math.min(fromMats, fromGuide, fromSkill)
+        skillCapped = (fromSkill == 0)
+        if maxCrafts < 1 then maxCrafts = skillCapped and 0 or 1 end
+    end
+
     -- 1) Keep the real macro in sync first (the button reads it by name)
     local macroOk, macroInfo
     if canBuild and not inCombat then
-        macroOk, macroInfo = A.Macro.Update(entry.spell, item, kind)
+        macroOk, macroInfo = A.Macro.Update(entry.spell, item, kind, maxCrafts)
     end
 
     -- 2) Set macro on castBtn. Pass the numeric INDEX returned by
@@ -1257,9 +1592,62 @@ local function RenderFooter()
                 castBtn:SetAttribute("macro", nil)
             end
         end
+        -- For tradeskill kinds (potion/elixir/rod/wand/oil), DoTradeSkill
+        -- needs the recipe list to be cached, which only happens after the
+        -- profession window has been opened ONCE this session. If the list
+        -- is empty we keep the button enabled (so the user can still try)
+        -- but flag it visually with "Open profession" so they know what to do.
+        local needsTradeskillList = (kind ~= "enchant")
+        local tradeskillListLoaded = (GetNumTradeSkills and GetNumTradeSkills() or 0) > 0
+        -- The single-craft companion button is only meaningful for
+        -- tradeskill kinds (an enchant always casts on a single item, so
+        -- there's no "1 vs N" choice). Reanchor macrosBtn so the layout
+        -- doesn't leave a hole when craft1Btn is hidden.
+        if craft1Btn then
+            if kind == "enchant" then
+                craft1Btn:Hide()
+                if macrosBtn then
+                    macrosBtn:ClearAllPoints()
+                    macrosBtn:SetPoint("LEFT", castBtn, "RIGHT", 6, 0)
+                end
+            else
+                craft1Btn:Show()
+                if macrosBtn then
+                    macrosBtn:ClearAllPoints()
+                    macrosBtn:SetPoint("LEFT", craft1Btn, "RIGHT", 6, 0)
+                end
+                if not inCombat then
+                    -- Macrotext directly (avoids needing a 2nd named macro).
+                    -- /run with DoTradeSkill works fine via macrotext.
+                    local body1 = A.Macro.Build(entry.spell, item, kind, 1)
+                    craft1Btn:SetAttribute("macro", nil)
+                    craft1Btn:SetAttribute("macrotext", body1 or "")
+                end
+                if canCast and tradeskillListLoaded then
+                    craft1Btn:Enable()
+                else
+                    craft1Btn:Disable()
+                end
+            end
+        end
+
         if canCast then
-            castBtn:Enable()
-            castBtn:SetText(kind == "enchant" and "Enchant" or "Craft")
+            if needsTradeskillList and not tradeskillListLoaded then
+                castBtn:Enable()
+                castBtn:SetText("Open profession once")
+            elseif kind == "enchant" then
+                castBtn:Enable()
+                castBtn:SetText("Enchant")
+            elseif skillCapped then
+                -- Skill goal met (current rank >= step.skillEnd or prof cap).
+                -- Disable the bulk button: nothing more to gain here.
+                castBtn:Disable()
+                castBtn:SetText("Step complete")
+            else
+                -- Show batch size so the user knows how many they're queueing.
+                castBtn:Enable()
+                castBtn:SetText(string.format("Craft (%d)", maxCrafts))
+            end
         else
             castBtn:Disable()
             if inCombat then              castBtn:SetText("(combat)")
@@ -1290,32 +1678,141 @@ local function RenderFooter()
 end
 
 -- ============================================================================
+-- Secure macrotext helper: makes any SecureActionButton additionally open
+-- the active profession's tradeskill window when clicked. We only set the
+-- macrotext when:
+--   * the active profession is NOT enchanting (kind != "enchant" everywhere)
+--   * the tradeskill list isn't already cached (GetNumTradeSkills == 0)
+-- That way, once the list IS loaded, clicking prev/next no longer toggles
+-- the window open/closed (the /cast on a tradeskill spell toggles its UI).
+-- Combat-safe: SetAttribute calls are no-ops in lockdown.
+-- ============================================================================
+local function UpdateProfOpenerSecure(button)
+    if not button or not button.SetAttribute then return end
+    if InCombatLockdown and InCombatLockdown() then return end
+
+    local def = A.Profession
+    local skill = def and def.skillName
+    local listLoaded = (GetNumTradeSkills and GetNumTradeSkills() or 0) > 0
+    -- Detect "enchant-style" profession by inspecting its first non-header
+    -- step's kind (if all are "enchant", we don't auto-open).
+    local isEnchant = false
+    if def and def.data and def.data.steps then
+        for _, s in ipairs(def.data.steps) do
+            if s.kind and s.kind ~= "header" then
+                isEnchant = (s.kind == "enchant")
+                break
+            end
+        end
+    end
+
+    if not skill or isEnchant or listLoaded then
+        button:SetAttribute("macrotext", nil)
+    else
+        button:SetAttribute("macrotext", "/cast " .. skill)
+    end
+end
+
+-- ============================================================================
+-- Profession switcher menu (UIDropDownMenu)
+-- ============================================================================
+local profMenuFrame
+local function BuildProfessionMenu()
+    if profMenuFrame then return profMenuFrame end
+    profMenuFrame = CreateFrame("Frame", "AlfredProfessionMenu", UIParent, "UIDropDownMenuTemplate")
+    UIDropDownMenu_Initialize(profMenuFrame, function(self, level)
+        local activeId = Alfred.GetActiveProfessionId()
+        for _, id in ipairs(Alfred.GetRegisteredProfessions()) do
+            local def = Alfred.GetProfession(id)
+            local learned, rank, max = Alfred.IsProfessionLearned(id)
+            local info = UIDropDownMenu_CreateInfo()
+            local marker = learned and "[*] " or "[ ] "
+            info.text = marker .. (def.name or id)
+                       .. (learned and string.format("  (%d/%d)", rank or 0, max or 0)
+                                    or "  (not learned)")
+            info.checked = (id == activeId)
+            info.func = function()
+                A.Engine.SwitchProfession(id)
+                CloseDropDownMenus()
+            end
+            info.notCheckable = false
+            UIDropDownMenu_AddButton(info, level)
+        end
+    end, "MENU")
+    return profMenuFrame
+end
+
+function A.UI.MainPanel.ToggleProfessionMenu(anchor)
+    local menu = BuildProfessionMenu()
+    ToggleDropDownMenu(1, nil, menu, anchor or "cursor", 0, 0)
+end
+
+-- Called by Engine.SwitchProfession after activeId/A.Profession have flipped.
+-- Refreshes the bits that were captured at Create() time (icon + title) and
+-- then re-runs RefreshAll so the rest of the panel reflects the new data.
+function A.UI.MainPanel.OnProfessionChanged()
+    if not mainFrame then return end
+    if headerIcon then
+        headerIcon:SetTexture(A.Profession.icon or "Interface\\Icons\\Trade_Engraving")
+    end
+    if titleStr then
+        titleStr:SetText(string.format("%sAlfred%s  -  %s  %s[v]%s",
+            C.cyan, C.reset, A.Profession.name or "Profession", C.dim, C.reset))
+    end
+    -- Reset selected slot — the new profession may not have any.
+    selectedSlotKey = nil
+    if A.UI.MainPanel.Refresh then A.UI.MainPanel.Refresh() end
+end
+
+-- ============================================================================
 -- Render: skill bar + nav step label
 -- ============================================================================
 local function RenderHeaderInfo()
     local data = A.Profession.data
     local maxSkill = (data and data.maxSkill) or 375
-    local rank, maxRank = A.Tradeskill.GetPlayerSkillRank()
-    rank = rank or 0
-    maxRank = maxRank or 0
+    local activeId = Alfred and Alfred.GetActiveProfessionId and Alfred.GetActiveProfessionId() or nil
+    local learned, lRank, lMax
+    if activeId and Alfred.IsProfessionLearned then
+        learned, lRank, lMax = Alfred.IsProfessionLearned(activeId)
+    end
+    -- A.Tradeskill.GetPlayerSkillRank reads from the active tradeskill window,
+    -- which only works when the trainer/tradeskill UI is open. The skill-line
+    -- API (cached in Registry) is always available for learned professions.
+    local rank    = (learned and lRank) or A.Tradeskill.GetPlayerSkillRank() or 0
+    local maxRank = (learned and lMax)  or (select(2, A.Tradeskill.GetPlayerSkillRank())) or 0
 
     if skillBarFill and skillBarText then
         local barW = (FRAME_W - PAD * 2 - 18 - 2)  -- track interior width
-        local pct = math.max(0, math.min(rank / maxSkill, 1))
+        local pct = math.max(0, math.min((rank or 0) / maxSkill, 1))
         skillBarFill:SetWidth(math.max(1, barW * pct))
-        skillBarText:SetText(string.format(
-            "%s%s%s   %s%d|r %s/ %d  (cap %d)|r",
-            C.cyan, A.Profession.skillName or A.Profession.name or "Skill", C.reset,
-            C.white, rank,
-            C.dim, maxSkill,
-            maxRank))
+        if learned then
+            skillBarText:SetText(string.format(
+                "%s%s%s   %s%d|r %s/ %d  (cap %d)|r",
+                C.cyan, A.Profession.skillName or A.Profession.name or "Skill", C.reset,
+                C.white, rank,
+                C.dim, maxSkill,
+                maxRank))
+        else
+            -- Single-line "not learned" notice rendered inside the skill bar so
+            -- it doesn't push content panels around. Yellow tint draws the eye
+            -- without needing an extra strip below the bar.
+            skillBarText:SetText(string.format(
+                "|cffe6b870[!] %s -- not learned (reference view)|r",
+                A.Profession.name or "This profession"))
+        end
     end
+
+    -- Keep the prev/next nav buttons' "open profession" macrotext fresh.
+    -- Re-evaluated on every refresh so it self-clears as soon as the
+    -- tradeskill list is loaded (avoids the /cast toggling the window).
+    UpdateProfOpenerSecure(prevBtn)
+    UpdateProfOpenerSecure(nextBtn)
 
     if navStepLabel then
         local cur   = A.UI.MainPanel.GetCurrentStep()
         local total = A.UI.MainPanel.GetTotalSteps()
         local entry = A.UI.MainPanel.GetGuideEntry(cur)
-        local rangeText = entry and string.format("  %s· %d-%d|r",
+        local rangeText = entry and string.format("  %s| %d-%d|r",
             C.dim, entry.skillStart or 0, entry.skillEnd or 0) or ""
         navStepLabel:SetText(string.format("%sStep|r %s%d / %d%s%s",
             C.dim, C.white, cur, total, C.reset, rangeText))
@@ -1339,6 +1836,8 @@ local function RefreshAll()
         RenderShoppingTab()
     elseif currentTab == "config" then
         RenderConfigTab()
+    elseif currentTab == "trainer" then
+        if RenderTrainerTab then RenderTrainerTab() end
     end
     RenderFooter()
 end
@@ -1346,20 +1845,55 @@ end
 A.UI.MainPanel.Refresh = RefreshAll
 AlfredEnchanting_RefreshGuide = RefreshAll
 
+-- Throttled refresh used by GET_ITEM_INFO_RECEIVED. Flood of events at boot
+-- (one per item) collapses into a single RefreshAll after a short delay.
+local iconRefreshScheduled = false
+function A.UI.MainPanel.QueueIconRefresh()
+    if iconRefreshScheduled or not mainFrame then return end
+    iconRefreshScheduled = true
+    A.Timer.After(0.5, function()
+        iconRefreshScheduled = false
+        if mainFrame and mainFrame:IsShown() then RefreshAll() end
+    end)
+end
+
 -- ============================================================================
 -- ShowTab: switch between Guide / Shopping List / Config
 -- ============================================================================
 local function ShowTab(which)
+    -- Remember the previous non-trainer tab so we can restore it when the
+    -- trainer window closes (we don't want users stranded on an empty tab).
+    if which ~= "trainer" then prevTab = which end
     currentTab = which
     -- Show the matching panel, hide the others
     if guidePanel    then if which == "guide"    then guidePanel:Show()    else guidePanel:Hide()    end end
     if shoppingPanel then if which == "shopping" then shoppingPanel:Show() else shoppingPanel:Hide() end end
     if configPanel   then if which == "config"   then configPanel:Show()   else configPanel:Hide()   end end
+    if trainerPanel  then if which == "trainer"  then trainerPanel:Show()  else trainerPanel:Hide()  end end
     -- Activate the matching tab, deactivate the others
     if tabGuide    then if which == "guide"    then tabGuide:Activate()    else tabGuide:Deactivate()    end end
     if tabShopping then if which == "shopping" then tabShopping:Activate() else tabShopping:Deactivate() end end
     if tabConfig   then if which == "config"   then tabConfig:Activate()   else tabConfig:Deactivate()   end end
+    if tabTrainer  then if which == "trainer"  then tabTrainer:Activate()  else tabTrainer:Deactivate()  end end
     RefreshAll()
+end
+
+-- Called by Core/Trainer.lua when a trainer window opens/closes.
+-- Reveals the Trainer tab, auto-shows the panel, and switches to it.
+function A.UI.MainPanel.OpenTrainerTab()
+    if not mainFrame then A.UI.MainPanel.Create() end
+    if tabTrainer then tabTrainer:Show() end
+    A.UI.MainPanel.Show()
+    ShowTab("trainer")
+end
+
+function A.UI.MainPanel.CloseTrainerTab()
+    if tabTrainer then tabTrainer:Hide() end
+    -- If the user was on the Trainer tab when the trainer closed, fall
+    -- back to whatever they were viewing before (kept in prevTab).
+    if currentTab == "trainer" then
+        ShowTab(prevTab or "guide")
+    end
 end
 
 A.UI.MainPanel.ShowTab = ShowTab
@@ -1368,19 +1902,40 @@ A.UI.MainPanel.GetCurrentTab = function() return currentTab end
 -- ============================================================================
 -- Step navigation
 -- ============================================================================
+local function IsHeaderStep(n)
+    local data = A.Profession and A.Profession.data
+    local s = data and data.steps and data.steps[n]
+    return s and s.kind == "header"
+end
+
+-- When SetStep lands on a header (via direct /alfred step N or via
+-- next/prev), advance in the requested direction until we hit a real step
+-- or run out. `dir` defaults to +1 (forward).
+local function SkipHeaders(n, dir)
+    local total = A.UI.MainPanel.GetTotalSteps()
+    dir = dir or 1
+    while n >= 1 and n <= total and IsHeaderStep(n) do
+        n = n + dir
+    end
+    if n < 1 then n = 1 end
+    if n > total then n = total end
+    return n
+end
+
 local function SetStep(n)
     local p = A.DB.Active()
     if not p then return end
     local total = A.UI.MainPanel.GetTotalSteps()
     if n < 1 then n = 1 end
     if n > total then n = total end
+    if IsHeaderStep(n) then n = SkipHeaders(n, 1) end
     p.currentStep = n
     RefreshAll()
 end
 
 A.UI.MainPanel.SetStep  = SetStep
-A.UI.MainPanel.NextStep = function() SetStep(A.UI.MainPanel.GetCurrentStep() + 1) end
-A.UI.MainPanel.PrevStep = function() SetStep(A.UI.MainPanel.GetCurrentStep() - 1) end
+A.UI.MainPanel.NextStep = function() SetStep(SkipHeaders(A.UI.MainPanel.GetCurrentStep() + 1,  1)) end
+A.UI.MainPanel.PrevStep = function() SetStep(SkipHeaders(A.UI.MainPanel.GetCurrentStep() - 1, -1)) end
 
 -- ============================================================================
 -- CreateMainFrame: draws the entire custom shell
@@ -1451,17 +2006,37 @@ function A.UI.MainPanel.Create()
     accent:SetPoint("TOPRIGHT", f, "TOPRIGHT", -1, -(HEADER_H + 1))
     ApplyGradient(accent)
 
-    -- Header icon (profession icon)
-    local headerIcon = f:CreateTexture(nil, "OVERLAY")
+    -- Header icon (profession icon) — file-level upvalue so we can refresh it
+    -- when the user switches to another profession.
+    headerIcon = f:CreateTexture(nil, "OVERLAY")
     headerIcon:SetSize(34, 34)
     headerIcon:SetPoint("LEFT", f, "TOPLEFT", 9, -(HEADER_H / 2))
     headerIcon:SetTexture(A.Profession.icon or "Interface\\Icons\\Trade_Engraving")
     headerIcon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
 
-    -- Title
-    local titleStr = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    titleStr:SetPoint("LEFT", f, "TOPLEFT", 50, -(HEADER_H / 2))
-    titleStr:SetText(string.format("%sAlfred%s  -  %s", C.cyan, C.reset, A.Profession.name or "Profession"))
+    -- Title — clickable area: opens the profession switcher.
+    local titleBtn = CreateFrame("Button", nil, f)
+    titleBtn:SetPoint("LEFT", f, "TOPLEFT", 50, -(HEADER_H / 2))
+    titleBtn:SetSize(260, 26)
+    titleStr = titleBtn:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    titleStr:SetPoint("LEFT", titleBtn, "LEFT", 0, 0)
+    titleStr:SetText(string.format("%sAlfred%s  -  %s  %s[v]%s",
+        C.cyan, C.reset, A.Profession.name or "Profession", C.dim, C.reset))
+    titleBtn:SetScript("OnEnter", function()
+        titleStr:SetText(string.format("%sAlfred%s  -  %s  %s[v]%s",
+            C.cyan, C.reset, A.Profession.name or "Profession", C.white, C.reset))
+        GameTooltip:SetOwner(titleBtn, "ANCHOR_BOTTOMLEFT")
+        GameTooltip:AddLine("Switch profession")
+        GameTooltip:AddLine("Click to pick another registered profession.", 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    titleBtn:SetScript("OnLeave", function()
+        titleStr:SetText(string.format("%sAlfred%s  -  %s  %s[v]%s",
+            C.cyan, C.reset, A.Profession.name or "Profession", C.dim, C.reset))
+        GameTooltip:Hide()
+    end)
+    titleBtn:SetScript("OnClick", function() A.UI.MainPanel.ToggleProfessionMenu(titleBtn) end)
+    profSwitcherBtn = titleBtn
 
     -- Close (X) button: flat, red on hover
     local closeBtn = CreateFrame("Button", "AlfredEnchantingClose", f)
@@ -1487,10 +2062,14 @@ function A.UI.MainPanel.Create()
     -- =========================================================================
     -- ROW 1: Nav (prev / step / next) + status (version)
     -- =========================================================================
-    prevBtn = MakeFlatButton(f, "<", 28, 24)
+    -- Nav buttons are SECURE so a click can also dispatch a /cast on the
+    -- profession's spell (opens the tradeskill window for non-enchant
+    -- professions). The SetStep handlers are attached via HookScript so
+    -- they run alongside the secure dispatch without breaking it.
+    prevBtn = MakeFlatSecureButton(f, "AlfredPrevStep", "<", 28, 24)
     prevBtn:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, NAV_Y)
-    prevBtn:RegisterForClicks("LeftButtonUp")
-    prevBtn:SetScript("OnClick", A.UI.MainPanel.PrevStep)
+    prevBtn:SetAttribute("type", "macro")
+    prevBtn:HookScript("OnClick", function() A.UI.MainPanel.PrevStep() end)
     prevBtn._lbl:SetFontObject("GameFontNormal")
 
     navStepLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -1499,10 +2078,10 @@ function A.UI.MainPanel.Create()
     navStepLabel:SetJustifyH("LEFT")
     navStepLabel:SetText("Step ? / ?")
 
-    nextBtn = MakeFlatButton(f, ">", 28, 24)
+    nextBtn = MakeFlatSecureButton(f, "AlfredNextStep", ">", 28, 24)
     nextBtn:SetPoint("LEFT", navStepLabel, "RIGHT", 4, 0)
-    nextBtn:RegisterForClicks("LeftButtonUp")
-    nextBtn:SetScript("OnClick", A.UI.MainPanel.NextStep)
+    nextBtn:SetAttribute("type", "macro")
+    nextBtn:HookScript("OnClick", function() A.UI.MainPanel.NextStep() end)
     nextBtn._lbl:SetFontObject("GameFontNormal")
 
     -- Keep global names for back-compat with external frame lookups
@@ -1516,17 +2095,27 @@ function A.UI.MainPanel.Create()
     -- =========================================================================
     -- ROW 2: Tabs Guide / Shopping List
     -- =========================================================================
-    tabGuide = MakeTSMTab(f, "Guide", 138)
+    -- Tab widths chosen so all four fit horizontally when the Trainer tab
+    -- is shown (4 * 116 + 3 * 2 = 470, fits inside FRAME_W - PAD*2 = 496).
+    local TAB_W = 116
+    tabGuide = MakeTSMTab(f, "Guide", TAB_W)
     tabGuide:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, TABS_Y)
     tabGuide:SetScript("OnClick", function() ShowTab("guide") end)
 
-    tabShopping = MakeTSMTab(f, "Shopping List", 138)
+    tabShopping = MakeTSMTab(f, "Shopping List", TAB_W)
     tabShopping:SetPoint("LEFT", tabGuide, "RIGHT", 2, 0)
     tabShopping:SetScript("OnClick", function() ShowTab("shopping") end)
 
-    tabConfig = MakeTSMTab(f, "Config", 138)
+    tabConfig = MakeTSMTab(f, "Config", TAB_W)
     tabConfig:SetPoint("LEFT", tabShopping, "RIGHT", 2, 0)
     tabConfig:SetScript("OnClick", function() ShowTab("config") end)
+
+    -- Trainer tab: hidden by default, shown only while a profession trainer
+    -- is open (Core/Trainer.lua + OpenTrainerTab/CloseTrainerTab below).
+    tabTrainer = MakeTSMTab(f, "Trainer", TAB_W)
+    tabTrainer:SetPoint("LEFT", tabConfig, "RIGHT", 2, 0)
+    tabTrainer:SetScript("OnClick", function() ShowTab("trainer") end)
+    tabTrainer:Hide()
 
     tabGuide:Activate()
 
@@ -1670,6 +2259,21 @@ function A.UI.MainPanel.Create()
     configPanel.scrollFrame = cScroll
     configPanel.scrollChild = cChild
 
+    -- Trainer panel (shown only while a profession trainer is open).
+    trainerPanel = CreateFrame("Frame", nil, f)
+    trainerPanel:SetPoint("TOPLEFT",     f, "TOPLEFT",     PAD,         CONTENT_Y)
+    trainerPanel:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -(PAD + 18), CONTENT_BOTTOM)
+    trainerPanel:Hide()
+    local tScroll = CreateFrame("ScrollFrame", "AlfredTrainerScroll", trainerPanel, "UIPanelScrollFrameTemplate")
+    tScroll:SetPoint("TOPLEFT",     trainerPanel, "TOPLEFT",     0, 0)
+    tScroll:SetPoint("BOTTOMRIGHT", trainerPanel, "BOTTOMRIGHT", 0, 0)
+    local tChild = CreateFrame("Frame", nil, tScroll)
+    tChild:SetWidth(FRAME_W - PAD * 2 - 36)
+    tChild:SetHeight(1)
+    tScroll:SetScrollChild(tChild)
+    trainerPanel.scrollFrame = tScroll
+    trainerPanel.scrollChild = tChild
+
     -- =========================================================================
     -- FOOTER (Icon + spell + item + req + mat-chips + Cast + status)
     -- =========================================================================
@@ -1701,7 +2305,7 @@ function A.UI.MainPanel.Create()
             GameTooltip:SetHyperlink("item:" .. self._itemId)
             GameTooltip:AddLine(" ")
             GameTooltip:AddLine(string.format(
-                "%sclick%s = AH · %sshift+click%s = chat · %sright-click%s = Wowhead",
+                "%sclick%s = AH | %sshift+click%s = chat | %sright-click%s = Wowhead",
                 C.dim, C.reset, C.dim, C.reset, C.dim, C.reset), 1, 1, 1, true)
         elseif self._spellName then
             GameTooltip:AddLine(self._spellName, 1, 1, 1)
@@ -1793,6 +2397,20 @@ function A.UI.MainPanel.Create()
     -- it's the only one that preserves the secure context to dispatch the
     -- macro. Replacing it with a Lua handler breaks the dispatch (verified
     -- on TBC Classic Anniversary).
+
+    -- Single-craft button (visible only for tradeskill kinds; reanchors
+    -- macrosBtn at refresh time depending on kind).
+    craft1Btn = MakeFlatSecureButton(f, "AlfredCraft1", "Craft 1", 64, 28)
+    craft1Btn:SetPoint("LEFT", castBtn, "RIGHT", 6, 0)
+    craft1Btn:SetAttribute("type", "macro")
+    craft1Btn:Hide()
+    craft1Btn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Craft a single one")
+        GameTooltip:AddLine("Useful for testing, or when you only need 1 more.", 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    craft1Btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     macrosBtn = MakeFlatButton(f, "Macros", 90, 28)
     macrosBtn:SetPoint("LEFT", castBtn, "RIGHT", 6, 0)

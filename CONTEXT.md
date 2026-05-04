@@ -6,7 +6,9 @@
 
 WoW addon for **Burning Crusade Classic Anniversary** (interface 20504) with a **multi-profession** architecture: a single profession-agnostic `Core` + independent `Professions/<X>.lua` modules registered via `Alfred.RegisterProfession({...})`.
 
-Today only Enchanting is implemented (levels 1-375). Tailoring, Alchemy, etc. are added as new files in `Professions/` without touching Core.
+Today **Enchanting** and **Alchemy** are implemented (levels 1-375). Tailoring, Blacksmithing, etc. are added as new files in `Professions/` without touching Core.
+
+**Design principle — every profession is always consultable.** All registered professions are available any day, regardless of whether the active character has them learned. The UI emphasises learned ones (default selection at boot, ● marker in the switcher) but never hides unlearned ones — the player can read guides, plan ahead, or compare across professions without having to log a different character. When the active profession isn't learned, a yellow banner replaces the skill bar text and the cast button stays disabled, but Guide and Shopping List tabs render fully.
 
 **Core idea**: the addon maintains a real WoW macro (`AlfredEnchant`) that updates dynamically to the current step of the guide. The macro does `/cast <enchant> + /use <item> + /click StaticPopup1Button1`. Clicking a floating button on the addon's panel runs the macro through a `SecureActionButton`.
 
@@ -19,11 +21,11 @@ Today only Enchanting is implemented (levels 1-375). Tailoring, Alchemy, etc. ar
 ## Project structure
 
 ```
-Alfred-Enchanting/
-├── Alfred-Enchanting.toc        ← manifest (interface 20504, version 4.1.0)
-├── Data.lua                     ← guide data + slots + slot map + shopping list (no logic)
+Alfred/
+├── Alfred.toc                   ← manifest (interface 20504, version 4.3.0)
+├── Data.lua                     ← Enchanting data: slots, slot map, steps, shopping list (no logic)
 ├── Core/
-│   ├── Registry.lua             ← _G.Alfred + Alfred.RegisterProfession + Get/SetActive
+│   ├── Registry.lua             ← _G.Alfred + RegisterProfession + Get/SetActive + IsProfessionLearned
 │   ├── DB.lua                   ← multi-prof AlfredDB schema + migration + accessors
 │   ├── Timer.lua                ← After() multiplexer (C_Timer doesn't exist in TBC)
 │   ├── Bags.lua                 ← C_Container compat + Find/Count items in bags
@@ -31,22 +33,25 @@ Alfred-Enchanting/
 │   ├── Reagents.lua             ← Parse + CheckStep
 │   ├── Tradeskill.lua           ← legacy tradeskill API (old bulk flow)
 │   ├── Macro.lua                ← Build + Update real macro (parameterized by A.Profession)
-│   ├── MainPanel.lua            ← panel + RefreshGuide + nav + pin + close button
+│   ├── MainPanel.lua            ← panel + tabs + selector + RefreshGuide + nav + pin + close
 │   ├── Minimap.lua              ← circular minimap button
-│   ├── Engine.lua               ← events + popup hook + legacy cast/bulk + skill tracking
-│   └── Slash.lua                ← /alfred, /aen, /eb, /alfred-enchanting
+│   ├── Engine.lua               ← events + popup hook + boot smart-default + SwitchProfession
+│   └── Slash.lua                ← /alfred (with `/alfred prof` subcommands), /aen, /eb
 ├── Professions/
-│   └── Enchanting.lua           ← Alfred.RegisterProfession({...}) with all the data
-├── Config.lua                   ← items panel, shift+click hook, public helpers
-└── Guide.lua                    ← standalone frame with detailed guide and shopping list
+│   ├── Enchanting.lua           ← Alfred.RegisterProfession({...}) with Enchanting adapter
+│   ├── AlchemyData.lua          ← Alchemy data (steps + shopping list, no logic)
+│   └── Alchemy.lua              ← Alfred.RegisterProfession({...}) with Alchemy adapter
+└── Config.lua                   ← items panel helpers, shift+click hook, public helpers
 ```
 
 Load order (in .toc):
 ```
-Data → Core/Registry → Professions/Enchanting → Core/DB → Core/Timer → Bags →
-Spells → Reagents → Tradeskill → Macro → MainPanel → Minimap → Engine → Slash →
-Config → Guide
+Data → Core/Registry → Professions/Enchanting → Professions/AlchemyData → Professions/Alchemy →
+Core/DB → Core/Timer → Bags → Spells → Reagents → Tradeskill → Macro → Items → AHPrices →
+MainPanel → Minimap → Engine → Slash → Config
 ```
+
+**Important**: Registry must load before any `Professions/*.lua` (they call `Alfred.RegisterProfession`). Each profession's data file must load before its adapter (the adapter references the global tables defined in the data file).
 
 ## Architecture: Core + Profession Registry
 
@@ -67,6 +72,12 @@ Config → Guide
 - `Alfred.RegisterProfession(def)` — register a profession
 - `Alfred.GetActiveProfession()`, `.GetActiveProfessionId()`, `.GetProfession(id)`
 - `Alfred.SetActiveProfession(id)`, `.GetRegisteredProfessions()`
+- `Alfred.IsProfessionLearned(id)` → `learned, currentRank, maxRank` (cached, invalidated on `SKILL_LINES_CHANGED`)
+- `Alfred.InvalidateLearnedCache()` — usually called automatically by Engine
+
+**`A.Engine`** (Core/Engine.lua):
+- `A.Engine.SwitchProfession(id)` — switches active profession, persists to DB, refreshes panel
+- `A.Engine.PickDefaultProfession()` — returns id of first learned, falling back to first registered
 
 **SavedVariables** (in .toc):
 - `AlfredDB` — current multi-profession schema:
@@ -114,11 +125,12 @@ Four aliases: `/alfred` (canonical), `/alfred-enchanting`, `/aen`, `/eb` (legacy
 | Command | Action |
 |---|---|
 | `/alfred show` / `/alfred hide` | toggle main panel |
+| `/alfred prof list` | list registered professions (with ●/○ learned markers) |
+| `/alfred prof <id>` | switch active profession (also accepts `/alfred prof set <id>`) |
 | `/alfred minimap` | toggle minimap button |
 | `/alfred config` | open items panel |
 | `/alfred step [N]` / `next` / `prev` | navigate steps |
 | `/alfred guide` | list steps in chat |
-| `/alfred guide window` | open detailed guide |
 | `/alfred pin <Frame>` / `auto` | pin panel to tradeskill UI |
 | `/alfred unpin` | free-floating |
 | `/alfred scan` | list visible relevant frames |
@@ -128,22 +140,39 @@ Four aliases: `/alfred` (canonical), `/alfred-enchanting`, `/aen`, `/eb` (legacy
 | `/alfred test` | current step requirements diagnostic |
 | `/alfred listen on/off` | log events to chat |
 
+The header title in the main panel is also clickable — opens the same dropdown.
+
 ## How to add a new profession
 
+Two files. Use Alchemy ([Professions/AlchemyData.lua](Professions/AlchemyData.lua) + [Professions/Alchemy.lua](Professions/Alchemy.lua)) as the canonical template.
+
+**1. `Professions/<Name>Data.lua`** — static data, no logic. Defines (as globals):
+- `Alfred<Name>Data` — `{ professionName, maxSkill, icon, steps = {{ skillStart, skillEnd, recipeName, kind, quantity, materials = {{name, itemId, quantity}, ...}, color, optional, notes }, ...} }`
+- `Alfred<Name>ShoppingList` — array of `{id, name, count}` (materials) and `{kind="recipe", id, name, vendor, req}` (vendor recipes)
+- `Alfred<Name>Guide` / `Alfred<Name>FullGuide` — derived back-compat tables (copy the loop at the bottom of AlchemyData.lua)
+
+**2. `Professions/<Name>.lua`** — adapter, single `Alfred.RegisterProfession({...})` call:
+
 ```lua
--- Professions/Tailoring.lua  (future)
 local _, A = ...
 Alfred.RegisterProfession({
     id   = "tailoring",
     name = "Tailoring",
+    skillName = "Tailoring",                 -- match against GetSkillLineInfo (must be exact)
+    icon = "Interface\\Icons\\Trade_Tailoring",
     MacroName = "AlfredTailor",
-    PopupName = nil,                         -- tailoring has no confirmation popup
-    LogPrefix = "|cff00ff00[Alfred:Tailoring]|r",
-    guide        = MyTailoringGuide,
-    fullGuide    = MyTailoringFullGuide,
-    shoppingList = MyTailoringShoppingList,
-    -- no slots/slotMap/slotDefaults: tailoring doesn't need target items
-    GetSpellIDFromRecipeLink = function(link) return link and tonumber(link:match("item:(%d+)")) end,
+    PopupName = nil,                         -- nil if the profession has no confirmation popup
+    LogPrefix = "|cff7fb87f[Alfred:Tailoring]|r",
+    data         = AlfredTailoringData,
+    guide        = AlfredTailoringGuide,
+    fullGuide    = AlfredTailoringFullGuide,
+    shoppingList = AlfredTailoringShoppingList,
+    -- omit slots/slotMap/slotDefaults if the profession doesn't target external items
+    GetSpellIDFromRecipeLink = function(link)
+        if not link then return nil end
+        local id = link:match("enchant:(%d+)")
+        return id and tonumber(id) or nil
+    end,
     IsTradeskillOpen = function()
         local line = GetTradeSkillLine and GetTradeSkillLine()
         return line == "Tailoring"
@@ -151,7 +180,9 @@ Alfred.RegisterProfession({
 })
 ```
 
-Add it to the .toc right after `Professions\Enchanting.lua`. Core treats it identically (same UI, same macro management, same skill tracking) — it just needs its own data + a small adapter.
+**3. Register in [Alfred.toc](Alfred.toc)** — add `Professions\<Name>Data.lua` and `Professions\<Name>.lua` *after* the existing professions and *before* `Core\DB.lua` (so DB.Init can iterate all registered professions).
+
+That's it. Core handles the rest: the dropdown picks it up, the smart-default boot sees it, the Guide/Shopping/Config tabs render automatically, the macro syncs by `MacroName`. New `kind` values for steps (e.g. `"flask"`, `"transmute"`) only need a one-line entry in `KIND_COLORS` in [Core/MainPanel.lua](Core/MainPanel.lua) — non-`"enchant"` kinds use the 1-line `/cast` macro template.
 
 ## Key components
 

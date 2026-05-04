@@ -1,13 +1,15 @@
 ## Interface: 20504
 ## Title: Alfred
-## Notes: Your personal butler for leveling professions. Step-by-step guides, auto-generated macros, recipe and mats validation. Currently supports: Enchanting.
+## Notes: Your personal butler for leveling professions. Step-by-step guides, auto-generated macros, recipe and mats validation. Currently supports: Enchanting, Alchemy.
 ## Author: Tu nombre
-## Version: 4.2.0
+## Version: 4.3.0
 ## SavedVariables: AlfredDB, AlfredEnchantingDB, EnchantButtonDB
 
 Data.lua
 Core\Registry.lua
 Professions\Enchanting.lua
+Professions\AlchemyData.lua
+Professions\Alchemy.lua
 Core\DB.lua
 Core\Timer.lua
 Core\Bags.lua
@@ -17,6 +19,9 @@ Core\Tradeskill.lua
 Core\Macro.lua
 Core\Items.lua
 Core\AHPrices.lua
+Core\VendorPrices.lua
+Core\CraftList.lua
+Core\Trainer.lua
 Core\MainPanel.lua
 Core\Minimap.lua
 Core\Engine.lua

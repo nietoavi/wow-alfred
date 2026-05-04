@@ -136,6 +136,73 @@ SlashCmdList["ALFREDENCHANTING"] = function(msg)
         local activeDB = A.DB.Active()
         if activeDB then activeDB.stats = {} end
         print("|cff00ff00[Alfred:Enchanting]|r Stats reset.")
+    elseif cmd == "prof" or cmd == "profession" then
+        local sub = args and args:lower():match("^(%S+)") or ""
+        local rest = args and args:match("^%S+%s+(.+)$") or nil
+        if sub == "" or sub == "list" then
+            print("|cff00ff00[Alfred]|r Registered professions:")
+            local activeId = Alfred.GetActiveProfessionId()
+            for _, id in ipairs(Alfred.GetRegisteredProfessions()) do
+                local def      = Alfred.GetProfession(id)
+                local learned, rank, max = Alfred.IsProfessionLearned(id)
+                local marker   = (id == activeId) and "|cff00ff00>|r" or " "
+                local dot      = learned and "|cff7fb87f[*]|r" or "|cff5a5e68[ ]|r"
+                local skillStr = learned and string.format(" |cff9094a0%d/%d|r", rank or 0, max or 0)
+                                          or " |cff5a5e68(not learned)|r"
+                print(string.format("  %s %s |cffeaeaee%-12s|r |cff5a5e68(%s)|r%s",
+                    marker, dot, def.name or id, id, skillStr))
+            end
+            print("|cff5a5e68  /alfred prof <id> to switch. > = active, [*] = learned, [ ] = not learned.|r")
+        elseif sub == "set" or Alfred.GetProfession(sub) then
+            -- Accept "/alfred prof set alchemy" and the shorthand "/alfred prof alchemy".
+            local target = (sub == "set") and (rest and rest:lower():match("^(%S+)") or "") or sub
+            if not target or target == "" then
+                print("|cffff9900[Alfred]|r Usage: /alfred prof <id>")
+                return
+            end
+            local ok, err = A.Engine.SwitchProfession(target)
+            if ok then
+                local learned = Alfred.IsProfessionLearned(target)
+                local def     = Alfred.GetProfession(target)
+                print(string.format("|cff00ff00[Alfred]|r Active profession: |cffeaeaee%s|r%s",
+                    def.name or target,
+                    learned and "" or " |cffc8a070(not learned — viewing as reference)|r"))
+            else
+                print("|cffff9900[Alfred]|r " .. tostring(err))
+            end
+        else
+            print("|cffff9900[Alfred]|r Unknown profession id '" .. tostring(sub) .. "'. Try /alfred prof list.")
+        end
+    elseif cmd == "recipes" then
+        local sub = args and args:lower():match("^(%S+)") or ""
+        local profId = Alfred.GetActiveProfessionId()
+        local def    = Alfred.GetProfession(profId)
+        if sub == "rescan" then
+            if not (def and def.IsTradeskillOpen and def.IsTradeskillOpen()) then
+                print("|cffff9900[Alfred]|r Open the " .. (def and def.name or "profession") .. " window first, then run /alfred recipes rescan.")
+                return
+            end
+            local added = (A.CraftList and A.CraftList.ScanOpenTradeskill and A.CraftList.ScanOpenTradeskill()) or 0
+            print(string.format("|cff00ff00[Alfred]|r Rescan complete: %d new recipe%s cached.",
+                added, added == 1 and "" or "s"))
+        elseif sub == "clear" then
+            if A.CraftList and A.CraftList.Clear then
+                A.CraftList.Clear(profId)
+                print("|cff00ff00[Alfred]|r Cleared cached recipe list for " .. (def and def.name or profId) .. " (this character).")
+            end
+        else
+            local learned, total = (A.CraftList and A.CraftList.GetStats and A.CraftList.GetStats(profId)) or (0, 0)
+            print(string.format("|cff00ff00[Alfred]|r %s recipes cached for this char: |cffeaeaee%d|r / %d listed in guide.",
+                (def and def.name) or "?", learned, total))
+            print("|cff5a5e68  /alfred recipes rescan -- re-scan the open profession window|r")
+            print("|cff5a5e68  /alfred recipes clear  -- forget cached recipes for this prof|r")
+        end
+    elseif cmd == "train" or cmd == "trainer" then
+        if not (A.Trainer and A.Trainer.Report) then
+            print("|cffff9900[Alfred]|r Trainer module not loaded.")
+            return
+        end
+        A.Trainer.Report(false)  -- non-silent: print "no matches" if empty
     elseif cmd == "stop" or cmd == "cancel" then
         A.Engine.BulkCancel()
     elseif cmd == "show" then
@@ -171,7 +238,7 @@ SlashCmdList["ALFREDENCHANTING"] = function(msg)
         if AlfredEnchanting_SetSlotByName then
             local ok, info = AlfredEnchanting_SetSlotByName(slotKey, itemName)
             if ok then
-                print("|cff00ff00[Alfred:Enchanting]|r |cffffd100" .. itemName .. "|r → |cffffd100" .. info .. "|r")
+                print("|cff00ff00[Alfred:Enchanting]|r |cffffd100" .. itemName .. "|r -> |cffffd100" .. info .. "|r")
             else
                 print("|cffff9900[Alfred:Enchanting]|r Error: " .. tostring(info))
             end
@@ -182,9 +249,9 @@ SlashCmdList["ALFREDENCHANTING"] = function(msg)
         for _, s in ipairs(slots) do
             local item = A.DB.GetSlotItem(s.key)
             if item and item ~= "" then
-                print(string.format("  |cffffd100%s|r → %s", s.key, item))
+                print(string.format("  |cffffd100%s|r -> %s", s.key, item))
             else
-                print(string.format("  |cff888888%s|r → (unassigned)", s.key))
+                print(string.format("  |cff888888%s|r -> (unassigned)", s.key))
             end
         end
     elseif cmd == "step" then
@@ -196,7 +263,7 @@ SlashCmdList["ALFREDENCHANTING"] = function(msg)
             local kind = entry and entry.kind or "enchant"
             local slot = (kind == "enchant") and MP.GetSlotForSpell(spell) or nil
             local item = slot and MP.GetItemForSlotKey(slot)
-            print(string.format("|cff00ff00[Alfred:Enchanting]|r Step |cffffd100%d/%d|r [%s · %s · %dx]: %s → %s",
+            print(string.format("|cff00ff00[Alfred:Enchanting]|r Step |cffffd100%d/%d|r [%s | %s | %dx]: %s -> %s",
                 n, total, kind, entry and entry.range or "?", entry and entry.count or 0,
                 tostring(spell), tostring(item or "(n/a)")))
             return
@@ -218,9 +285,9 @@ SlashCmdList["ALFREDENCHANTING"] = function(msg)
         local current = MP.GetCurrentStep()
         for i = 1, total do
             local entry = MP.GetGuideEntry(i)
-            local marker = (i == current) and "|cff00ff00→|r " or "  "
+            local marker = (i == current) and "|cff00ff00>|r " or "  "
             local kindColor = kindColors[entry.kind or "enchant"] or "ffffffff"
-            print(string.format("  %s|cff888888%2d|r |c%s[%s]|r %s |cffaaaaaa(%s · %dx)|r",
+            print(string.format("  %s|cff888888%2d|r |c%s[%s]|r %s |cffaaaaaa(%s | %dx)|r",
                 marker, i, kindColor, (entry.kind or "?"):sub(1, 4),
                 entry.spell or "?",
                 entry.range or "?", entry.count or 0))
@@ -381,8 +448,12 @@ SlashCmdList["ALFREDENCHANTING"] = function(msg)
             print(string.format("|cffaaaaaa  Total: %d. Use /eb pin <Name> to pin.|r", found))
         end
     else
-        print("|cff00ff00[Alfred:Enchanting]|r Commands (aliases: /alfred, /aen, /eb):")
+        print("|cff00ff00[Alfred]|r Commands (aliases: /alfred, /aen, /eb):")
         print("  /alfred show / hide          — show/hide floating panel")
+        print("  /alfred prof list            — list registered professions")
+        print("  /alfred prof <id>            — switch active profession")
+        print("  /alfred recipes [rescan]     — learned-recipe cache (rescan from open window)")
+        print("  /alfred train                — list guide recipes available at the open trainer")
         print("  /alfred minimap              — toggle minimap button")
         print("  /alfred config               — open items panel")
         print("  /alfred step [N] / next / prev   — navigate guide steps")
