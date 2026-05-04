@@ -2081,7 +2081,10 @@ function A.UI.MainPanel.Create()
     navStepLabel:SetText("Step ? / ?")
 
     nextBtn = MakeFlatSecureButton(f, "AlfredNextStep", ">", 28, 24)
-    nextBtn:SetPoint("LEFT", navStepLabel, "RIGHT", 4, 0)
+    -- Anchor to the mainframe instead of navStepLabel (a FontString).
+    -- Protected frames (SecureActionButton) cannot be anchored to regions,
+    -- only to other frames. Position computed: PAD + prev_width + gap + label_width + gap.
+    nextBtn:SetPoint("TOPLEFT", f, "TOPLEFT", PAD + 28 + 10 + 220 + 4, NAV_Y)
     nextBtn:SetAttribute("type", "macro")
     nextBtn:HookScript("OnClick", function() A.UI.MainPanel.NextStep() end)
     nextBtn._lbl:SetFontObject("GameFontNormal")
